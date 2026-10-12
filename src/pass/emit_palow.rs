@@ -11883,6 +11883,35 @@ impl<'a> Body<'a> {
             .map_err(|_| "the type of a subexpression could not be inferred".to_string())
     }
 
+    /// Look through a cast from one pointer type to another when deciding
+    /// *where* a dereference reads. `(float *)i` and `i` are the same address
+    /// -- Palow's `ptr` carries no type -- so the cast changes the type of the
+    /// access, not the storage it reaches, and the ownership question is the
+    /// one `i` already answers.
+    ///
+    /// Only pointer-to-pointer casts are looked through. `(T *)n` for an
+    /// integer `n` manufactures an address out of nothing and has to keep
+    /// granting nothing, which is what `test/ptr_int_cast` pins.
+    ///
+    /// What this does *not* do is decide that the access is legal. It stops
+    /// the emitter refusing to translate, and leaves the result to slprop
+    /// matching -- where reading storage at a type its effective type does
+    /// not admit fails on `{t}_etype_ok`, which is 6.5p7.
+    fn strip_ptr_casts<'e>(&self, e: &'e Expr) -> &'e Expr {
+        let e = strip_vattr(e);
+        match &e.val {
+            ExprT::Cast(inner, _) => {
+                let is_ptr = |x: &Expr| matches!(self.ty_of(x), Ok(t) if matches!(t.val, TypeT::Pointer(..)));
+                if is_ptr(e) && is_ptr(inner) {
+                    self.strip_ptr_casts(inner)
+                } else {
+                    e
+                }
+            }
+            _ => e,
+        }
+    }
+
     /// Make a union arm the live one, leaving its storage uninitialised.
     ///
     /// C says the member you last wrote is the one you may read, and the
@@ -12629,7 +12658,7 @@ impl<'a> Body<'a> {
             // pointee in the contract; a pointer that was itself loaded out of
             // memory -- `*s->next`, `**p` -- does not, and the caller would
             // have had to grant it in a `_requires` that is not translated.
-            ExprT::Deref(inner) => match &strip_vattr(inner).val {
+            ExprT::Deref(inner) => match &self.strip_ptr_casts(inner).val {
                 // `*(&e)` is `e`. Clang leaves the pair in the AST, and
                 // nothing is loaded by it: the address of a named object is
                 // that object's address.
@@ -12873,7 +12902,7 @@ impl<'a> Body<'a> {
                 let a = self.addr_only(base)?;
                 Ok(format!("({} +! {}_offsetof_{})", a, sn, f.val))
             }
-            ExprT::Deref(inner) => match &strip_vattr(inner).val {
+            ExprT::Deref(inner) => match &self.strip_ptr_casts(inner).val {
                 ExprT::Ref(place) => self.addr_only(place),
                 // A checked block is named by the allocation rather than by
                 // the local that holds it, so that every mention of it is the
