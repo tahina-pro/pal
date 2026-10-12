@@ -2464,6 +2464,19 @@ impl<'a> Spec<'a> {
         let ExprT::Var(v) = &base.val else {
             return Err("a contract that dereferences a computed pointer".to_string());
         };
+        // A subscript of a `_pure` array global published as a sequence
+        // constant is `Seq.index` of that constant: there is nothing to own,
+        // which is also how a body reads it.
+        if let Some(i) = idx
+            && !self.pointees.contains_key(&*v.val)
+            && let Some(t) = self.global_array_const(v)
+        {
+            let i = self.num(i, w)?;
+            self.guards
+                .borrow_mut()
+                .push(format!("{} < Seq.length {}", i, t));
+            return Ok(format!("(Seq.index {} {})", t, i));
+        }
         let Some((pre, post)) = self.pointees.get(&*v.val) else {
             return Err(format!("`*{}` in a contract", v.val));
         };
@@ -9698,6 +9711,28 @@ fn emit_globals(tds: &Typedefs, tu: &TranslationUnit) -> Vec<Chunk> {
                         n,
                         term
                     );
+                    // A pointer into the table -- `&table[j]`, or a field of
+                    // an entry decayed to a pointer -- needs a read share of
+                    // the entry it lands in. The storage is static and
+                    // immutable, so a share is acquired per entry exactly as
+                    // `acquire_var_*` acquires one of a scalar global, and
+                    // given back by dropping it. The offset is assumed in the
+                    // same breath: the object exists, so its size fits.
+                    if let TypeT::FixedArray(elem, _) = &tds.resolve(&gv.ty).val
+                        && let (Some(pn), Some(esize)) =
+                            (palow_name(tds, elem), palow_sizeof(tds, elem))
+                    {
+                        let at = format!("(addr_var_{} +! elem_off_var_{} i)", name, name);
+                        let own = format!(
+                            "exists* (p: perm). {}_pts_to {} p (Seq.index var_{} (SizeT.v i))",
+                            pn, at, name
+                        );
+                        out += &format!(
+                            "assume val elem_off_var_{name} : (i: SizeT.t {{ SizeT.v i < {n} }}) -> (o: SizeT.t {{ SizeT.v o == {esize} * SizeT.v i }})\n\n\
+                             assume val acquire_elem_var_{name} : (i: SizeT.t {{ SizeT.v i < {n} }}) -> stt_ghost unit emp_inames emp\n  (fun _ -> {own})\n\n\
+                             ghost fn release_elem_var_{name} (i: SizeT.t {{ SizeT.v i < {n} }})\n  requires {own}\n  ensures  emp\n{{\n  drop_ ({own})\n}}\n\n"
+                        );
+                    }
                 }
             }
             chunks.push(Chunk {
@@ -11737,6 +11772,9 @@ struct Body<'a> {
     /// Local pointers loaded once out of memory, with what they were loaded
     /// from. See `ptr_source_map`.
     ptr_src: HashMap<String, Rc<Expr>>,
+    /// Locals bound once to a converted parameter, `void *b = (void *)q;`:
+    /// the structure a byte offset from `b` lands in. See `byte_base_map`.
+    byte_bases: HashMap<String, Rc<Expr>>,
     /// Locals bound once from a call. A code pointer carries no
     /// ownership, so the only thing that can make a call through one
     /// possible is an `is_valid` fact, and a callee that returns a
@@ -12091,6 +12129,67 @@ impl<'a> Body<'a> {
         }
     }
 
+    /// `table[i]` where `table` is an array global published as a sequence
+    /// constant: the table's name and the index as a `size_t`. Such an entry
+    /// has an address inside the global's storage, and a read share of it is
+    /// what `acquire_elem_var_<table>` hands out.
+    fn global_elem(&mut self, e: &Expr) -> Result<Option<(String, String)>, String> {
+        let ExprT::Index(arr, idx) = &strip_vattr(e).val else {
+            return Ok(None);
+        };
+        let ExprT::Var(v) = &strip_vattr(arr).val else {
+            return Ok(None);
+        };
+        if self.env.lookup_var(v).is_some()
+            || self.slots.iter().any(|s| s.name == *v.val)
+            || !self.global_array_value(v)
+        {
+            return Ok(None);
+        }
+        let Ok(ety) = self.ty_of(e) else {
+            return Ok(None);
+        };
+        if palow_name(self.tds, &ety).is_none() || palow_sizeof(self.tds, &ety).is_none() {
+            return Ok(None);
+        }
+        let n = self.global_array_len(v).unwrap_or(0);
+        let literal = const_index(&strip_vattr(idx).val).is_some_and(|k| k < n);
+        if !literal && !self.signed_ok {
+            return Err(format!(
+                "a subscript of `{}`, whose bounds obligation needs the untranslated `_requires`",
+                v.val
+            ));
+        }
+        let i = self.index(idx)?;
+        Ok(Some((v.val.to_string(), i)))
+    }
+
+    /// Whether this path starts at an entry of a constant table.
+    fn global_root(&self, e: &Expr) -> bool {
+        match &strip_vattr(e).val {
+            ExprT::Member(b, _) => self.global_root(b),
+            ExprT::Index(arr, _) => match &strip_vattr(arr).val {
+                ExprT::Var(v) => {
+                    self.env.lookup_var(v).is_none()
+                        && self.slots.iter().all(|s| s.name != *v.val)
+                        && self.global_array_value(v)
+                }
+                _ => self.global_root(arr),
+            },
+            _ => false,
+        }
+    }
+
+    /// The address of a global table's entry, and the lines that acquire and
+    /// give back a read share of it.
+    fn acquire_global_elem(&mut self, g: &str, i: &str) -> (String, String) {
+        self.lines.push(format!("acquire_elem_var_{} {};", g, i));
+        (
+            format!("(addr_var_{} +! elem_off_var_{} {})", g, g, i),
+            format!("release_elem_var_{} {};", g, i),
+        )
+    }
+
     /// The constant an lvalue reads, when it is rooted at a global nothing in
     /// the program can write. Returns the type at that path together with the
     /// initialiser that reached it; `None` means the path is covered by
@@ -12225,6 +12324,13 @@ impl<'a> Body<'a> {
             // value lives, and reading through that is the access this is
             // not.
             ExprT::Var(v) => {
+                // An array global published as a sequence constant is a value
+                // too, so `table[j].offset` is `Seq.index` and then a field
+                // projection, the same as for a parameter. Its length is in
+                // the constant's type, so `Seq.index` carries the bound.
+                if self.slots.iter().all(|s| s.name != *v.val) && self.global_array_value(v) {
+                    return Some(format!("var_{}", v.val));
+                }
                 let v = v.val.to_string();
                 if !self.params.contains(&v) {
                     return None;
@@ -12666,6 +12772,11 @@ impl<'a> Body<'a> {
             // afterwards, exactly as a subscript does; the difference is that
             // the access happens in the callee rather than here.
             ExprT::Index(base, idx) => {
+                if let Some((g, i)) = self.global_elem(e)? {
+                    let (at, close) = self.acquire_global_elem(&g, &i);
+                    self.pending_close.push(close);
+                    return Ok(at);
+                }
                 // An array field of a struct the contract holds in pieces is
                 // not the emitter's to hand out: whatever owns those bytes is
                 // whatever the contract said owns them, and all the body needs
@@ -12783,6 +12894,9 @@ impl<'a> Body<'a> {
                 }
                 _ => self.rvalue(inner),
             },
+            ExprT::Index(..) if let Some((g, i)) = self.global_elem(e)? => {
+                Ok(format!("(addr_var_{} +! elem_off_var_{} {})", g, g, i))
+            }
             _ => self.addr(e),
         }
     }
@@ -13673,6 +13787,12 @@ impl<'a> Body<'a> {
                 f.open_read.clone()
             });
             return Ok((f.at, f.close_read, f.close_write));
+        }
+        // An entry of a constant table is static storage nobody owns, so
+        // a read share of it is acquired for the access and dropped after.
+        if let Some((g, i)) = self.global_elem(base)? {
+            let (at, close) = self.acquire_global_elem(&g, &i);
+            return Ok((at, vec![close.clone()], vec![close]));
         }
         // The same for `a[i].f`, and for every kind of array there is: a
         // parameter, a local, a global, an allocated block. Which of them the
@@ -15197,6 +15317,16 @@ impl<'a> Body<'a> {
                 if let Some(x) = self.const_read(e) {
                     return Ok(x);
                 }
+                // An array field of a constant table's entry, decayed to a
+                // pointer, is an address inside the table's storage -- not
+                // the field's value, which is what `value_read` would give.
+                if let ExprT::Member(base, f) = &e.val
+                    && self.global_root(base)
+                    && let Ok(fty) = self.field_ty(base, f)
+                    && matches!(peel(self.tds, &fty).val, TypeT::FixedArray(..))
+                {
+                    return self.addr_only(e);
+                }
                 // A path into a parameter passed by value is a projection out
                 // of a record this function already holds, not a read of
                 // memory.
@@ -15416,6 +15546,16 @@ impl<'a> Body<'a> {
                     self.lines.extend(fl);
                     return Ok(format!("(if {} then {} else {})", cv, tv, fv));
                 }
+                // Pulse joins the arms by matching on the condition, and when
+                // an arm is itself an `if` -- `a ? x : b ? y : z` -- the outer
+                // join can only be reduced if the condition is a name.
+                let cv = if is_fstar_name(&cv) {
+                    cv
+                } else {
+                    let b = self.fresh("test");
+                    self.lines.push(format!("let {} = {};", b, cv));
+                    b
+                };
                 let r = self.fresh("cond");
                 self.lines
                     .push(format!("let {} : {} = if ({}) {{", r, fty, cv));
@@ -15582,6 +15722,9 @@ impl<'a> Body<'a> {
                 {
                     Ok(format!("addr_var_{}", v.val))
                 }
+                // `&table[j]` hands out the entry, so a read share of it
+                // goes along for the statement, as a focus would.
+                ExprT::Index(..) if self.global_root(inner) => self.addr(inner),
                 _ => self.addr_only(inner),
             },
             // A PAL primitive (`prims.rs`) is a definition in the Pulse
@@ -16009,10 +16152,50 @@ impl<'a> Body<'a> {
                 && matches!(peel(self.tds, &aty).val, TypeT::FixedArray(..))
             {
                 let (sn, _) = self.struct_of(base)?;
-                let at = self.addr_only(base)?;
+                // The struct itself may have to be opened first -- an entry
+                // of a constant table is acquired -- and that is given back
+                // after the field is.
+                let (at, _, close) = if self.global_root(base) {
+                    self.base_addr(base, true)?
+                } else {
+                    (self.addr_only(base)?, Vec::new(), Vec::new())
+                };
                 self.lines.push(format!("{}_focus_{} {};", sn, f.val, at));
                 self.pending_close
                     .push(format!("{}_unfocus_{} {};", sn, f.val, at));
+                self.pending_close.extend(close);
+            }
+            // An array field decayed into a parameter that is not `_array`
+            // is the address of its first element, and a one-object pointer
+            // owns just that element. So the element is focused out of the
+            // field for the statement -- the same focus `s->name[0]` takes --
+            // and the argument is its address.
+            if i < outs.len()
+                && !outs[i]
+                && arr_args.get(i) != Some(&true)
+                && arrayptr_args.get(i) != Some(&true)
+                && plain_ptrs.get(i) != Some(&true)
+                && consumes.get(i) != Some(&true)
+                && let ExprT::Member(base, _) = &strip_casts(a).val
+                && self.union_of(base).is_none()
+                && !self.in_pieces(base)
+                && let Ok(aty) = self.ty_of(strip_casts(a))
+                && matches!(peel(self.tds, &aty).val, TypeT::FixedArray(..))
+            {
+                let writing = consts.get(i) != Some(&true);
+                let fo = self.focus_elem(strip_casts(a), None, writing)?;
+                self.lines.extend(if writing {
+                    fo.open_write.iter().cloned()
+                } else {
+                    fo.open_read.iter().cloned()
+                });
+                self.pending_close.extend(if writing {
+                    fo.close_write
+                } else {
+                    fo.close_read
+                });
+                out += &format!(" {}", fo.at);
+                continue;
             }
             let v = if outs.get(i) == Some(&true) {
                 self.out_arg(a)?
@@ -18021,10 +18204,28 @@ impl<'a> Body<'a> {
         let head = self.inline(cond);
         self.in_guard = false;
         let head = head?;
-        if self.lines.len() != before {
+        // A condition that reads through a focus -- `i < d->n` -- is a
+        // statement sequence, not a term. Pulse's guard is a block, so the
+        // sequence goes there and is run again on every iteration, which is
+        // what C does: the field is read anew each time round. It is emitted
+        // again as an ordinary value so `&&` and `||` keep their short
+        // circuit: `i < r->count && r->data[i]` must not read past the end.
+        let head = if self.lines.len() != before {
             self.lines.truncate(before);
-            return Err("a loop whose condition needs a focused access".to_string());
-        }
+            self.in_guard = true;
+            let head = self.rvalue(cond);
+            self.in_guard = false;
+            let head = head?;
+            let pre = self.lines.split_off(before);
+            let mut g = String::from("{\n");
+            for l in &pre {
+                g.push_str(&format!("    {}\n", l));
+            }
+            g.push_str(&format!("    {}\n  }}", head));
+            g
+        } else {
+            head
+        };
 
         // What the author claims about the exit of a `break`ing loop needs a
         // name for each local it mentions that survives the loop. A ghost
@@ -18199,7 +18400,223 @@ impl<'a> Body<'a> {
     /// back. A local array handed to a callee is converted to the view the
     /// callee asks for, and the way back can only be emitted once the call
     /// has been -- so it is owed here rather than emitted in place.
+    /// The structure a byte pointer is the address of: `(void *)q`, or a
+    /// local that is another name for it, where `q` points at a struct.
+    fn byte_root(&self, b: &Rc<Expr>) -> Option<(Rc<Expr>, String)> {
+        let mut s = b.clone();
+        while let ExprT::Cast(x, _) | ExprT::VAttr(_, x) = &s.val {
+            s = x.clone();
+        }
+        if let Ok(t) = self.ty_of(&s)
+            && let TypeT::Pointer(st, _) = &peel(self.tds, &t).val
+            && let TypeT::TypeRef(TypeRefKind::Struct(n)) = &peel(self.tds, st).val
+            && self.tds.structs.contains_key(&*n.val)
+        {
+            return Some((s, n.val.to_string()));
+        }
+        if let ExprT::Var(v) = &s.val {
+            if let Some(x) = self.byte_bases.get(&*v.val) {
+                return self.byte_root(&x.clone());
+            }
+            if let Some(place) = self.aliases.get(&*v.val)
+                && let ExprT::Deref(x) = &place.val
+            {
+                return self.byte_root(x);
+            }
+        }
+        None
+    }
+
+    /// Every field of structure `sn` -- nested structures included -- whose
+    /// type is the one Palow names `pn`, as its byte offset and the C
+    /// expression for its address.
+    fn fields_of_type(
+        &self,
+        sn: &str,
+        lv: &Rc<Expr>,
+        at: u64,
+        pn: &str,
+        out: &mut Vec<(u64, Rc<Expr>)>,
+    ) {
+        let Some(si) = self.tds.structs.get(sn) else {
+            return;
+        };
+        for f in &si.fields {
+            let m = ExprT::Member(
+                lv.clone(),
+                Rc::<str>::from(f.name.as_str()).with_loc(lv.loc.clone()),
+            )
+            .with_loc(lv.loc.clone());
+            // A bit-field storage unit is in `fields` under a name C does not
+            // have, so it is no field a pointer can be taken to.
+            if self.ty_of(&m).is_err() {
+                continue;
+            }
+            if palow_name(self.tds, &f.ty).as_deref() == Some(pn) {
+                out.push((
+                    at + f.offset,
+                    ExprT::Ref(m.clone()).with_loc(lv.loc.clone()),
+                ));
+            }
+            if let TypeT::TypeRef(TypeRefKind::Struct(n)) = &peel(self.tds, &f.ty).val {
+                self.fields_of_type(&n.val, &m, at + f.offset, pn, out);
+            }
+        }
+    }
+
+    /// The first `(T *)(base + off)` in `e` where `base` is a byte pointer to
+    /// a structure: the expression itself, `off`, and the fields of type `T`
+    /// the result can be, by offset.
+    #[allow(clippy::type_complexity)]
+    fn byte_field_site(
+        &self,
+        e: &Rc<Expr>,
+    ) -> Result<Option<(Rc<Expr>, Rc<Expr>, Vec<(u64, Rc<Expr>)>)>, String> {
+        if let ExprT::Cast(inner, pty) = &e.val
+            && let TypeT::Pointer(t, _) = &peel(self.tds, pty).val
+            && let ExprT::BinOp(BinOp::Add, b, off) = &strip_vattr(inner).val
+            && let Ok(bty) = self.ty_of(b)
+            && let TypeT::Pointer(bt, _) = &peel(self.tds, &bty).val
+            && matches!(
+                peel(self.tds, bt).val,
+                TypeT::Void | TypeT::Int { width: 8, .. }
+            )
+            && let Some((q, sn)) = self.byte_root(b)
+        {
+            let pn = palow_name(self.tds, t)
+                .ok_or_else(|| format!("a byte-offset pointer to {}", describe(t)))?;
+            let lv = ExprT::Deref(q.clone()).with_loc(q.loc.clone());
+            let mut cands = Vec::new();
+            self.fields_of_type(&sn, &lv, 0, &pn, &mut cands);
+            if cands.is_empty() {
+                return Err(format!(
+                    "a byte-offset pointer to {} into `struct {}`, which has no field of that type",
+                    describe(t),
+                    sn
+                ));
+            }
+            return Ok(Some((e.clone(), off.clone(), cands)));
+        }
+        for x in expr_operands(e) {
+            if let Some(r) = self.byte_field_site(x)? {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A statement that reaches a field through a byte offset from the start
+    /// of its structure -- `*(T *)((char *)q + off)`, or the same pointer
+    /// handed to a callee -- written as the field access it is.
+    ///
+    /// C allows this because the result points at an object of type `T`
+    /// inside `*q`; which object depends on `off`. A constant offset names one
+    /// field, and the pointer is simply `&q->f`. A computed one -- read out of
+    /// a descriptor table, typically -- is one of the fields of type `T`, so
+    /// the statement becomes a case split over their offsets, with each arm
+    /// the ordinary field access. That the offset *is* one of them is the
+    /// assertion in front of the split: it is what C's rule demands of the
+    /// program, and if the solver cannot see it the pointer may land between
+    /// fields, which is exactly what has to be refused.
+    fn split_byte_field(&mut self, s: &Stmt) -> Result<Option<Rc<Stmt>>, String> {
+        let roots: Vec<&Rc<Expr>> = match &s.val {
+            StmtT::Call(e) | StmtT::Return(Some(e)) => vec![e],
+            StmtT::Assign(l, r) => vec![l, r],
+            _ => return Ok(None),
+        };
+        let mut site = None;
+        for r in &roots {
+            if let Some(x) = self.byte_field_site(r)? {
+                site = Some(x);
+                break;
+            }
+        }
+        let Some((site, off, cands)) = site else {
+            return Ok(None);
+        };
+        let rebuild = |with: &Rc<Expr>| -> Rc<Stmt> {
+            let v = match &s.val {
+                StmtT::Call(e) => StmtT::Call(replace_subexpr(e, &site, with)),
+                StmtT::Return(Some(e)) => StmtT::Return(Some(replace_subexpr(e, &site, with))),
+                StmtT::Assign(l, r) => StmtT::Assign(
+                    replace_subexpr(l, &site, with),
+                    replace_subexpr(r, &site, with),
+                ),
+                _ => unreachable!(),
+            };
+            v.with_loc(s.loc.clone())
+        };
+        if let Some(k) = const_index(&strip_vattr(&off).val) {
+            let Some((_, a)) = cands.iter().find(|(o, _)| *o == k) else {
+                return Err(format!(
+                    "a byte-offset pointer at offset {}, where no field of its type is",
+                    k
+                ));
+            };
+            return Ok(Some(rebuild(a)));
+        }
+        if has_effects(&off) {
+            return Err("a byte-offset field pointer whose offset has side effects".to_string());
+        }
+        let o = self.index(&off)?;
+        let alts: Vec<String> = cands
+            .iter()
+            .map(|(k, _)| format!("SizeT.v {} == {}", o, k))
+            .collect();
+        self.lines
+            .push(format!("assert (pure ({}));", alts.join(" \\/ ")));
+        let oty = self.ty_of(&off)?;
+        let test = |k: u64| {
+            let lit =
+                ExprT::IntLit(Rc::new(BigInt::from(k)), oty.clone()).with_loc(off.loc.clone());
+            ExprT::BinOp(BinOp::Eq, off.clone(), lit).with_loc(off.loc.clone())
+        };
+        let mut cands = cands;
+        let (_, last) = cands.pop().unwrap();
+        // Where the pointer is only used to compute a value, only that value
+        // is split: `off == K1 ? v1 : v2`. Splitting the whole statement would
+        // put whatever it then does with the value -- a store into an array,
+        // say -- into every arm, and Pulse would have to join arms that each
+        // changed more than the field they read.
+        let value_root = match &s.val {
+            StmtT::Return(Some(e)) => Some(e),
+            StmtT::Assign(l, r) if !Rc::ptr_eq(l, &site) && self.byte_field_site(l)?.is_none() => {
+                Some(r)
+            }
+            _ => None,
+        };
+        if let Some(root) = value_root {
+            let mut acc = replace_subexpr(root, &site, &last);
+            for (k, a) in cands.into_iter().rev() {
+                acc = ExprT::Cond(test(k), replace_subexpr(root, &site, &a), acc)
+                    .with_loc(root.loc.clone());
+            }
+            let v = match &s.val {
+                StmtT::Return(_) => StmtT::Return(Some(acc)),
+                StmtT::Assign(l, _) => StmtT::Assign(l.clone(), acc),
+                _ => unreachable!(),
+            };
+            return Ok(Some(v.with_loc(s.loc.clone())));
+        }
+        let mut acc: Rc<Stmts> = Rc::new(vec![rebuild(&last)]);
+        for (k, a) in cands.into_iter().rev() {
+            acc = Rc::new(vec![
+                StmtT::If {
+                    cond: test(k),
+                    then_branch: Rc::new(vec![rebuild(&a)]),
+                    else_branch: acc,
+                    ensures: Rc::new(Vec::new()),
+                }
+                .with_loc(s.loc.clone()),
+            ]);
+        }
+        Ok(Some(acc[0].clone()))
+    }
+
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        if let Some(s2) = self.split_byte_field(s)? {
+            return self.stmt(&s2);
+        }
         let r = self.stmt_inner(s);
         let close = std::mem::take(&mut self.pending_close);
         let open = std::mem::take(&mut self.own_open);
@@ -18869,7 +19286,16 @@ impl<'a> Body<'a> {
                 // unprovable. Binding the call first costs nothing -- C
                 // evaluates the condition once anyway -- and makes the
                 // branch hypothesis usable.
-                let c = if nt.is_none() && matches!(strip_vattr(cond).val, ExprT::FnCall(..)) {
+                // The same goes for an `if` whose arm is another `if`: the
+                // inner join is stated in terms of the outer condition.
+                let nested = then_branch
+                    .iter()
+                    .chain(else_branch.iter())
+                    .any(|x| matches!(x.val, StmtT::If { .. }));
+                let c = if nt.is_none()
+                    && (matches!(strip_vattr(cond).val, ExprT::FnCall(..))
+                        || (nested && !is_fstar_name(&c)))
+                {
                     let t = self.fresh("cond");
                     self.lines.push(format!("let {} = {};", t, c));
                     t
@@ -19080,6 +19506,13 @@ impl<'a> Body<'a> {
     /// which is what a chain of early returns needs.
     fn rest(&mut self, stmts: &[Rc<Stmt>]) -> Result<bool, String> {
         for (i, s) in stmts.iter().enumerate() {
+            if matches!(s.val, StmtT::Return(Some(_)))
+                && let Some(s2) = self.split_byte_field(s)?
+            {
+                let mut tail = vec![s2];
+                tail.extend(stmts[i + 1..].iter().cloned());
+                return self.rest(&tail);
+            }
             match &s.val {
                 StmtT::Return(e) => {
                     if let Some(e) = e {
@@ -20390,6 +20823,84 @@ fn subst_var(e: &Rc<Expr>, from: &str, to: &Rc<Expr>) -> Option<Rc<Expr>> {
     }
 }
 
+/// Whether an F\* term is a bare name, which Pulse can reduce a join on.
+fn is_fstar_name(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+}
+
+/// The operands of the expression forms a byte-offset field pointer can sit
+/// inside. Anything else is opaque to `byte_field_site`, which then simply
+/// does not look into it.
+fn expr_operands(e: &Rc<Expr>) -> Vec<&Rc<Expr>> {
+    match &e.val {
+        ExprT::Deref(x)
+        | ExprT::Ref(x)
+        | ExprT::Member(x, _)
+        | ExprT::VAttr(_, x)
+        | ExprT::UnOp(_, x)
+        | ExprT::Cast(x, _) => vec![x],
+        ExprT::Index(a, b) | ExprT::BinOp(_, a, b) | ExprT::AssignExpr(a, b) => vec![a, b],
+        ExprT::Cond(a, b, c) => vec![a, b, c],
+        ExprT::FnCall(_, xs) => xs.iter().collect(),
+        ExprT::FnPtrCall(f, xs) => std::iter::once(f).chain(xs.iter()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `e` with the one subexpression that *is* `target` (by identity) replaced.
+/// Only the forms `expr_operands` looks into are rebuilt, which is exactly
+/// where a target can have been found.
+fn replace_subexpr(e: &Rc<Expr>, target: &Rc<Expr>, with: &Rc<Expr>) -> Rc<Expr> {
+    if Rc::ptr_eq(e, target) {
+        return with.clone();
+    }
+    let go = |x: &Rc<Expr>| replace_subexpr(x, target, with);
+    let v = match &e.val {
+        // `*&q->f` is `q->f`, which is what sends a read or write down the
+        // field path rather than through a bare address.
+        ExprT::Deref(x) => {
+            let x = go(x);
+            if let ExprT::Ref(m) = &x.val {
+                return m.clone();
+            }
+            ExprT::Deref(x)
+        }
+        ExprT::Ref(x) => ExprT::Ref(go(x)),
+        ExprT::Member(x, f) => ExprT::Member(go(x), f.clone()),
+        ExprT::VAttr(a, x) => ExprT::VAttr(a.clone(), go(x)),
+        ExprT::UnOp(o, x) => ExprT::UnOp(*o, go(x)),
+        ExprT::Cast(x, t) => ExprT::Cast(go(x), t.clone()),
+        ExprT::Index(a, b) => ExprT::Index(go(a), go(b)),
+        ExprT::BinOp(o, a, b) => ExprT::BinOp(*o, go(a), go(b)),
+        ExprT::AssignExpr(a, b) => ExprT::AssignExpr(go(a), go(b)),
+        ExprT::Cond(a, b, c) => ExprT::Cond(go(a), go(b), go(c)),
+        ExprT::FnCall(n, xs) => ExprT::FnCall(n.clone(), xs.iter().map(go).collect()),
+        ExprT::FnPtrCall(f, xs) => ExprT::FnPtrCall(go(f), xs.iter().map(go).collect()),
+        _ => return e.clone(),
+    };
+    v.with_loc(e.loc.clone())
+}
+
+/// Whether evaluating an expression can change anything, so that evaluating it
+/// once more -- as the test of a case split -- is not the same program.
+fn has_effects(e: &Rc<Expr>) -> bool {
+    match &e.val {
+        ExprT::FnCall(..)
+        | ExprT::FnPtrCall(..)
+        | ExprT::AssignExpr(..)
+        | ExprT::PreIncr(_)
+        | ExprT::PostIncr(_)
+        | ExprT::PreDecr(_)
+        | ExprT::PostDecr(_)
+        | ExprT::Malloc(..)
+        | ExprT::Free(_)
+        | ExprT::InlinePulse(..) => true,
+        _ => expr_operands(e).into_iter().any(has_effects),
+    }
+}
+
 fn strip_vattr(e: &Expr) -> &Expr {
     match &e.val {
         ExprT::VAttr(_, inner) => strip_vattr(inner),
@@ -20710,6 +21221,45 @@ fn balanced(s: &str) -> bool {
 /// exactly the question it is good at: the load carries a `rewrites_to` to the
 /// field's value, and a body that had overwritten the field would be matching
 /// against the new value and fail.
+/// The locals bound exactly once to a conversion of a name the body never
+/// rebinds -- `void *stats_base = (void *)q;` -- with that conversion. Such a
+/// local is the structure's address under another type for the whole call,
+/// which is what lets `stats_base + off` be read as an offset into `*q`.
+fn byte_base_map(body: &Stmts) -> HashMap<String, Rc<Expr>> {
+    let mut t = Touched::default();
+    touch_stmts(body, &mut t);
+    let locals: HashSet<String> = body
+        .iter()
+        .filter_map(|s| match &s.val {
+            StmtT::Decl(n, _) => Some(n.val.to_string()),
+            _ => None,
+        })
+        .collect();
+    let mut out = HashMap::new();
+    for st in body.iter() {
+        let StmtT::Assign(lhs, rhs) = &st.val else {
+            continue;
+        };
+        let Some(q) = lvalue_name(lhs) else {
+            continue;
+        };
+        if !locals.contains(&q) || t.rebound.get(&q) != Some(&1) {
+            continue;
+        }
+        let ExprT::Cast(..) = &strip_vattr(rhs).val else {
+            continue;
+        };
+        let ExprT::Var(v) = &strip_casts(rhs).val else {
+            continue;
+        };
+        if locals.contains(&*v.val) || t.rebound.get(&*v.val).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        out.insert(q, rhs.clone());
+    }
+    out
+}
+
 fn ptr_source_map(body: &Stmts) -> HashMap<String, Rc<Expr>> {
     let mut t = Touched::default();
     touch_stmts(body, &mut t);
@@ -20907,6 +21457,7 @@ fn emit_body(
         blocks: Vec::new(),
         aliases: aliases,
         ptr_src: ptr_source_map(&defn.body),
+        byte_bases: byte_base_map(&defn.body),
         fp_from_call: call_bound_map(&defn.body),
         array_aliases: array_alias_map(tds, &defn.body),
         active: HashMap::new(),

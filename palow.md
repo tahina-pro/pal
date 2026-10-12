@@ -6343,3 +6343,61 @@ new facts about memory.
     position. A `$witness` before a call to a function with no ghost
     arguments is an error rather than being ignored. `test/ghost_arg_direct`
     covers this.
+37. **Subscripts of a global array of structs** (#358). A `_pure` array
+    global with a literal initialiser is published as a sequence constant,
+    and a subscript of one with a symbolic index already read as `Seq.index`
+    of it -- but only as the whole expression. `table[j].offset` stopped at
+    the member access and fell through to the array-parameter path. The
+    body's by-value projections (`value_read`) now treat such a global as a
+    value root, so `table[j].offset`, `entries[i].range.hi` and
+    `entries[i].tag[k]` become `Seq.index` followed by field projections.
+    Contracts had the same gap even for scalar tables (`scalars[i]` was
+    "`*scalars` in a contract"); there the subscript is now `Seq.index` of
+    the constant, guarded by its length. `test/global_struct_table` covers
+    this.
+38. **A field reached by byte offset** (#358). `(T *)((char *)q + off)`
+    where `q` points at a struct -- directly, or through a local bound once
+    to `(void *)q` -- points at whichever field of type `T` sits at byte
+    offset `off`, nested structs included. The IFB driver reads its counters
+    this way, with the offsets taken from a constant descriptor table, and
+    hands the pointer to `u64_stats_read`. A constant offset names one field,
+    and the pointer is `&q->f`. A computed one becomes a case split over the
+    offsets of the fields of type `T`, after
+    `assert (pure (off == K1 \/ ... \/ off == Kn))`. That assertion is C's own
+    requirement that the pointer lands on an object of type `T`, so an offset
+    the solver cannot place on a field is refused. Where the pointer only
+    feeds a value (a `return`, or an assignment's right side), only that
+    value is split, as `off == K1 ? v1 : ...`, so the arms change nothing
+    but the field they read. A write or a bare call splits the whole
+    statement. Pulse joins nested arms only if each condition is a name, so
+    a conditional expression whose arms need statements, and an `if` whose
+    arm is another `if`, now bind a compound condition first.
+    `test/offset_table_read` covers reads, a call, a write, a constant offset
+    and nested fields.
+39. **A loop condition that reads through a focus** (#359). `i < d->n`
+    needs `d->n` focused, read and unfocused -- statements, which a guard
+    built as a pure term could not hold, so the loop was refused. Pulse's
+    `while` guard is itself a block, so those statements now go inside it
+    and run again on every iteration, as C's condition does: a body that
+    changes `d->n` is seen by the next test. Such a guard is emitted as an
+    ordinary value, so `&&` and `||` keep their short circuit --
+    `i < r->count && r->data[i] != 0` reads the element only when `i` is in
+    bounds. `test/loop_cond_field` covers both, and a body that shrinks the
+    bound.
+40. **A pointer into a constant table** (#360). Since #358 a path into a
+    published array global reads as `Seq.index` and projections, and that
+    was also what `table[j].name` became where the field decays to a
+    pointer -- the array's value where the callee wanted an address. Such a
+    path now has the address it denotes, `addr_var_table +!
+    elem_off_var_table j +! offsetof`, with `elem_off_var_table` assumed
+    alongside the table, as its address is. Where the pointer has to carry
+    ownership -- `&table[j]`, `&table[j].offset`, a decayed field handed to a
+    callee -- the entry's read share is acquired for the statement with an
+    assumed `acquire_elem_var_table j` and dropped after with
+    `release_elem_var_table j`. That is the trust `acquire_var_*` and
+    `acquire_literal_*` already ask for: one fact about static, immutable
+    storage. A variadic argument takes only the address. Separately, an
+    array field decayed into a pointer parameter that is not `_array` --
+    `use_name(d->name)` for any owned `d` -- now focuses its first element,
+    which is all a one-object pointer owns. `test/global_table_array_field`
+    covers these cases.
