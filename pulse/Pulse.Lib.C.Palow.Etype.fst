@@ -224,6 +224,44 @@ and access_ok_trans_members (ms: list (nat & ctype)) (d: int) (s: ctype) (off: i
       if access_ok m (d - o) s then access_ok_trans m (d - o) s off fld
       else access_ok_trans_members r d s off fld
 
+(* 6.5p7 bullet 3, as a rule about *any* object rather than about a declared
+   one. `case_1_2_signed_unsigned_counterpart` already records that an `int`
+   object may be read through `unsigned int *`, but it says so for the closed
+   index `etypes_of ct_i32 true`, which the solver settles by computation.
+   A read through a pointer reaches storage whose index is a variable, so the
+   rule has to be available in open form.
+
+   The scalar cases are where the content is. An access permitted because the
+   byte's type *is* the type read becomes one permitted by the counterpart
+   disjunct, and an access already permitted by that disjunct becomes one
+   permitted because the types are equal -- `counterpart_involutive` is what
+   turns the second into the first. The aggregate cases only have to carry
+   the rule inwards, and the bounds survive because a counterpart has the
+   same width. *)
+let rec access_ok_counterpart (ty: ctype) (off: int) (s: scalar)
+  : Lemma (requires b2t (access_ok ty off (TScalar s)))
+          (ensures  b2t (access_ok ty off (TScalar (counterpart s))))
+          (decreases %[ctype_size ty; 0])
+  = let u = TScalar s in
+    let u' = TScalar (counterpart s) in
+    if u = tchar then ()
+    else if off = 0 && ty = u then ()
+    else if off = 0 && counterpart_ok ty u then ()
+    else match ty with
+         | TScalar _ -> ()
+         | TArr e n -> access_ok_counterpart e (emod off (csize e)) s
+         | TStruct _ _ ms -> access_ok_counterpart_members ms off s
+         | TUnion _ _ ms -> access_ok_counterpart_members ms off s
+and access_ok_counterpart_members (ms: list (nat & ctype)) (off: int) (s: scalar)
+  : Lemma (requires b2t (access_ok_members ms off (TScalar s)))
+          (ensures  b2t (access_ok_members ms off (TScalar (counterpart s))))
+          (decreases %[members_size ms; 1])
+  = match ms with
+    | [] -> ()
+    | (o, m) :: r ->
+      if access_ok m (off - o) (TScalar s) then access_ok_counterpart m (off - o) s
+      else access_ok_counterpart_members r off s
+
 (* One entry per byte: which object this byte belongs to, and which byte of it
    this is. `fixed` distinguishes a declared object, whose type is settled for
    its whole lifetime, from allocated storage, which takes its effective type
@@ -311,6 +349,26 @@ let read_ok_sub (e: etypes) (s: ctype) (off: nat) (fld: ctype)
           match eget e' k with
           | None -> ()
           | Some en -> access_ok_trans en.ty (en.off - (off + k)) s off fld
+    in
+    FStar.Classical.forall_intro aux
+
+(* And the same rule lifted from a single byte to a whole access: an object
+   readable at a scalar type is readable at that type's signed or unsigned
+   counterpart. This is the form a typed read through a pointer needs, and
+   the only thing standing between `int32_t_etype_ok e` and
+   `uint32_t_etype_ok e`. *)
+let read_ok_counterpart (e: etypes) (s: scalar)
+  : Lemma (requires read_ok e (TScalar s))
+          (ensures  read_ok e (TScalar (counterpart s)))
+  = let aux (k: nat)
+      : Lemma (k < elen e ==>
+               (match eget e k with
+                | None -> True
+                | Some en -> b2t (access_ok en.ty (en.off - k) (TScalar (counterpart s)))))
+      = if k < elen e then
+          match eget e k with
+          | None -> ()
+          | Some en -> access_ok_counterpart en.ty (en.off - k) s
     in
     FStar.Classical.forall_intro aux
 
