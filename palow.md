@@ -442,6 +442,18 @@ of `should-fail` to appear in its output, so a test cannot start failing for
 some unrelated reason and still look like it is doing its job. The file there
 names `aligned (a +! FStar.SizeT.uint_to_t 1)` and `uint32_t_alignof`.
 
+A second kind of negative test landed later, for the case where the thing being
+pinned is PAL's own refusal rather than a failed proof. When PAL cannot
+translate a body it says why, stubs the body with `admit()`, and puts an
+`assert False` in `TranslationErrors.fst` so that F\* rejects the build -- but
+it exits 0, and it writes that file either way, empty when there is nothing to
+report. A refusal therefore already fails a normal test; what it cannot do is
+say *which* refusal, since every untranslated body fails identically. A test
+directory may carry a **`refuse`** file instead, and the template `Makefile`
+then requires PAL to have refused *and* requires every line of `refuse` to
+appear in what it said. `test/etype_store_declared_bad` and
+`test/etype_retype_partial_bad` use it.
+
 #### What it cost
 
 The numbers are in "Alignment is cheap except on wide structs" under

@@ -1,0 +1,1 @@
+a store at `int32_t` that re-types a block held at `int64_t`: the two are 4 and 8 bytes wide, and re-typing part of an object is not covered

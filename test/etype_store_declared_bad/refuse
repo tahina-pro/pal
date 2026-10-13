@@ -1,0 +1,1 @@
+a store at `float64_t` into `x`, which is declared as `int64_t`: an object with a declared type keeps it, so this is not a re-typing store but undefined behaviour (C11 6.5p6)

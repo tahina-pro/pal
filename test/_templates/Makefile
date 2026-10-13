@@ -28,6 +28,40 @@ endif
 
 all: verify compile
 
+# A test PAL itself must refuse carries a `refuse` file. When PAL cannot
+# translate a body it says why, stubs the body with `admit()` and puts an
+# `assert False` in `TranslationErrors.fst` so that F* rejects the build -- but
+# it still exits 0, and it writes that file either way, empty when there is
+# nothing to report. So a refusal already fails a normal test; what it does not
+# do is say *which* refusal, since every untranslated body fails the same way.
+# This target pins the reason: PAL must have refused, and every line of
+# `refuse` must appear in what it said.
+ifneq ($(wildcard refuse),)
+
+translate:
+	@mkdir -p $(OUT_DIR)
+	@$(C2PULSE) $(PAL_OPTS) --outdir $(OUT_DIR) $(C_FILES) \
+		>$(OUT_DIR)/translate.log 2>&1 || true
+	@if ! grep -q "assert False" $(OUT_DIR)/TranslationErrors.fst 2>/dev/null; then \
+		echo "ERROR: $(CURDIR) translated, but refuse says it must not" >&2; \
+		cat $(OUT_DIR)/translate.log >&2; \
+		exit 1; \
+	fi
+	@while IFS= read -r pat; do \
+		[ -z "$$pat" ] && continue; \
+		if ! grep -qF -- "$$pat" $(OUT_DIR)/translate.log; then \
+			echo "ERROR: $(CURDIR) was refused, but not for the expected reason:" >&2; \
+			echo "       no line of the output contains '$$pat'" >&2; \
+			cat $(OUT_DIR)/translate.log >&2; \
+			exit 1; \
+		fi; \
+	done < refuse; \
+	echo "Refused as expected: $(CURDIR)"
+
+verify: translate
+
+else
+
 translate: $(OUT_DIR)/.stamp
 
 $(OUT_DIR)/.stamp: $(C_FILES) $(H_FILES) $(C2PULSE) pal.h
@@ -61,6 +95,8 @@ verify: $(OUT_DIR)/.stamp
 	@$(MAKE) --no-print-directory -f ../verify.mk \
 		OUT_DIR=$(OUT_DIR) FSTAR_EXE="$(FSTAR_EXE)" CACHE_DIR=$(CACHE_DIR) \
 		HELPERS=$(HELPERS)
+endif
+
 endif
 
 compile: $(patsubst %.c,$(OBJ_DIR)/%.o,$(C_FILES))
