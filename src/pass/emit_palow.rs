@@ -1204,6 +1204,25 @@ fn palow_name(tds: &Typedefs, ty: &Type) -> Option<String> {
     }
 }
 
+/// The width of a scalar Palow type, for the types whose storage layer
+/// publishes the whole `_forget` / `_reveal_uninit_at` / `_claim_uninit` set.
+///
+/// This is what bounds re-typing to the cases the model can actually take: a
+/// struct or a union has no `_reveal_uninit_at`, so there is no way to get at
+/// its bytes and hand them back at another type, and `None` here is what turns
+/// that into a refusal rather than a wrong translation. Every one of these
+/// types has `alignof == sizeof`, so agreeing on the width is also agreeing on
+/// the alignment, which is the other half of what the claim needs.
+fn palow_scalar_size(pn: &str) -> Option<u64> {
+    Some(match pn {
+        "bool_t" | "int8_t" | "uint8_t" => 1,
+        "int16_t" | "uint16_t" => 2,
+        "int32_t" | "uint32_t" | "float32_t" => 4,
+        "int64_t" | "uint64_t" | "size_t" | "float64_t" | "ptr" => 8,
+        _ => return None,
+    })
+}
+
 /// The F* type of a C value.
 fn fstar_type(tds: &Typedefs, ty: &Type) -> Option<String> {
     if let TypeT::TypeRef(TypeRefKind::Typedef(n)) = &ty.val {
@@ -17775,6 +17794,73 @@ impl<'a> Body<'a> {
         Ok(())
     }
 
+    /// 6.5p6: a store into storage that has no declared type gives the object
+    /// the type of the lvalue stored through, and the old effective type is
+    /// gone. The model takes that step with `mem_retype`, which relabels the
+    /// index and keeps the bytes; going out through `_forget` and back in
+    /// through `_claim_uninit` is what discards the old *value* along with the
+    /// old type.
+    ///
+    /// Discarding the value is not bookkeeping. `mem_retype` alone keeps the
+    /// bytes, so between two types that share a representation it would carry
+    /// the value across -- which is laundering, not re-typing. Coming back as
+    /// uninitialised storage is what makes the step mean what C means, and it
+    /// is also what C says: the new object's value is whatever was stored, not
+    /// whatever the bytes used to spell at the old type.
+    ///
+    /// Only an allocated block can take this step, which is the condition C
+    /// states and not a restriction of the model's: a declared object keeps
+    /// its declared type for its whole lifetime (6.5p6 again), so the slot
+    /// path deliberately has no counterpart to this.
+    fn retype_block(&mut self, i: usize, to: &str) -> Result<(), String> {
+        let from = self.blocks[i].pn.clone();
+        let b = &self.blocks[i];
+        // A block held in pieces, as an array, or as a flexible struct is not
+        // one object whose type can be exchanged for another: what its bytes
+        // are at is a different question per element or per field.
+        if b.array.is_some() || b.flex.is_some() || b.bytes.is_some() || !b.scattered.is_empty() {
+            return Err(format!(
+                "a store at `{}` into a block held at `{}`, which is not a single object",
+                to, from
+            ));
+        }
+        let (Some(fw), Some(tw)) = (palow_scalar_size(&from), palow_scalar_size(to)) else {
+            return Err(format!(
+                "a store at `{}` that re-types a block held at `{}`, and one of those \
+                 is not a scalar the storage layer can hand back as raw bytes",
+                to, from
+            ));
+        };
+        // `mem_retype` relabels exactly the bytes it is given, so the new type
+        // has to want the same ones. A narrower or wider store re-types part
+        // of the object, which needs the range split first and is a different
+        // operation.
+        if fw != tw {
+            return Err(format!(
+                "a store at `{}` that re-types a block held at `{}`: the two are {} and {} \
+                 bytes wide, and re-typing part of an object is not covered",
+                to, from, tw, fw
+            ));
+        }
+        let tmp = b.tmp.clone();
+        let init = b.init;
+        if init {
+            self.lines.push(format!("{}_forget {};", from, tmp));
+        }
+        self.lines
+            .push(format!("{}_reveal_uninit_at {};", from, tmp));
+        self.lines.push(format!("mem_retype {} {}_ctype;", tmp, to));
+        self.lines.push(format!("{}_claim_uninit {};", to, tmp));
+        let b = &mut self.blocks[i];
+        b.pn = to.to_string();
+        // Whatever the block held is not there any more, so the store that
+        // follows is the initialising one and `free` has to take the block
+        // back at its new type.
+        b.init = false;
+        b.zero = None;
+        Ok(())
+    }
+
     /// Store into an lvalue, choosing the initialising store when the target
     /// is a slot that has not been written yet.
     fn store(&mut self, lhs: &Expr, pn: &str, value: &str) -> Result<(), String> {
@@ -17823,12 +17909,26 @@ impl<'a> Body<'a> {
             }
         }
         if let ExprT::Deref(inner) = &lhs.val {
-            if let ExprT::Var(v) = &strip_vattr(inner).val {
+            // A cast on the pointer does not change which object is being
+            // stored into -- `*(double *)i` is a store into the block `i`
+            // names -- but it does change what type the store makes it. So
+            // the block has to be found through the cast, not in spite of it.
+            if let ExprT::Var(v) = &strip_casts(inner).val {
                 if let Some(i) = self
                     .blocks
                     .iter()
                     .position(|b| b.var == *v.val && b.checked && !b.freed)
                 {
+                    // The lvalue's type is what the store makes the object,
+                    // and it need not be what the block is holding: C allows
+                    // the same allocated bytes to be used at one type and then
+                    // at another. Taking that step explicitly is what keeps
+                    // the generated proof honest -- without it the write is
+                    // emitted against a points-to at the old type and nothing
+                    // here says so.
+                    if self.blocks[i].pn != pn {
+                        self.retype_block(i, pn)?;
+                    }
                     let op = if self.blocks[i].init {
                         "write"
                     } else {
@@ -17878,6 +17978,23 @@ impl<'a> Body<'a> {
             return Ok(());
         }
         let a = self.addr(lhs)?;
+        // 6.5p6 again, from the other side. An object with a declared type has
+        // that type as its effective type for its whole lifetime: no store can
+        // exchange it, the way a store into allocated storage can. So a store
+        // that disagrees with what the slot was declared as is undefined, and
+        // saying so is the whole point -- the alternative is to emit the write
+        // against the points-to still held at the declared type, which does
+        // not translate the C and does not say that it did not.
+        if let Some(s) = self.slots.iter().find(|s| s.addr == a)
+            && s.palow_ty != pn
+        {
+            return Err(format!(
+                "a store at `{}` into `{}`, which is declared as `{}`: an object with a \
+                 declared type keeps it, so this is not a re-typing store but undefined \
+                 behaviour (C11 6.5p6)",
+                pn, s.name, s.palow_ty
+            ));
+        }
         // A store of a whole union value picks the live member from the value
         // itself, which the emitter does not read back.
         self.active.remove(&a);
