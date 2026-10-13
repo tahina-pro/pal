@@ -1064,6 +1064,9 @@ impl<'a> Elaborator<'a> {
                 self.elab_rvalue(env, Rc::make_mut(v), Some(&slprop_ty));
                 self.cast_to_slprop(env, v);
             }
+            StmtT::Retype { ptr, .. } => {
+                self.elab_rvalue(env, Rc::make_mut(ptr), None);
+            }
             StmtT::GhostStmt(code) => self.elab_inline_pulse_code(env, Rc::make_mut(code)),
             StmtT::Goto(_) => {}
             StmtT::Label { ensures, .. } => {

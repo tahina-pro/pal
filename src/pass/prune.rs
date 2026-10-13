@@ -343,6 +343,10 @@ fn scan_stmt(deps: &mut HashSet<DeclName>, stmt: &Stmt) {
             }
         }
         StmtT::Assert(v) => scan_expr(deps, v),
+        StmtT::Retype { ptr, ty } => {
+            scan_expr(deps, ptr);
+            scan_type(deps, ty);
+        }
         StmtT::GhostStmt(code) => scan_inline_pulse_code(deps, code),
         StmtT::Goto(_) => {}
         StmtT::Label { ensures, .. } => {

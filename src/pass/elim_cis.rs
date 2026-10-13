@@ -254,6 +254,7 @@ fn rewrite_stmts(env: &Env, stmts: &mut Stmts, elim: &HashMap<Rc<IdentT>, ElimUn
 fn rewrite_stmt(env: &Env, stmt: &mut Stmt, elim: &HashMap<Rc<IdentT>, ElimUnion>) {
     match &mut stmt.val {
         StmtT::Call(e) | StmtT::Assert(e) => rewrite_expr(env, Rc::make_mut(e), elim),
+        StmtT::Retype { ptr, .. } => rewrite_expr(env, Rc::make_mut(ptr), elim),
         StmtT::DeclStackArray { size, .. } => rewrite_expr(env, Rc::make_mut(size), elim),
         StmtT::Let(_, _, value) => rewrite_expr(env, Rc::make_mut(value), elim),
         StmtT::Assign(lhs, rhs) => {
@@ -554,6 +555,10 @@ fn rewrite_types_stmt(stmt: &mut Stmt, elim: &HashMap<Rc<IdentT>, ElimUnion>) {
     match &mut stmt.val {
         StmtT::Call(e) | StmtT::Assert(e) | StmtT::Return(Some(e)) => {
             rewrite_types_expr(Rc::make_mut(e), elim)
+        }
+        StmtT::Retype { ptr, ty } => {
+            rewrite_types_expr(Rc::make_mut(ptr), elim);
+            rewrite_type(ty, elim);
         }
         StmtT::Decl(_, ty) => rewrite_type(ty, elim),
         StmtT::Let(_, ty, value) => {

@@ -751,6 +751,10 @@ fn collect_refs_stmt(s: &Stmt, out: &mut Vec<TypeKey>) {
     };
     match &s.val {
         StmtT::Call(e) | StmtT::Assert(e) => collect_refs_expr(e, out),
+        StmtT::Retype { ptr, ty } => {
+            collect_refs_expr(ptr, out);
+            collect_type_refs(ty, out);
+        }
         StmtT::Decl(_, ty) => collect_type_refs(ty, out),
         StmtT::Let(_, ty, value) => {
             collect_type_refs(ty, out);

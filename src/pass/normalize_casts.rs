@@ -220,6 +220,12 @@ fn normalize_stmt(env: &Env, stmt: &mut Stmt) {
         StmtT::Call(expr) | StmtT::Assert(expr) | StmtT::Return(Some(expr)) => {
             normalize_expr(env, Rc::make_mut(expr));
         }
+        // The type is the annotation's whole content and is not a conversion
+        // on the pointer, so it is left exactly as written.
+        StmtT::Retype { ptr, ty } => {
+            normalize_expr(env, Rc::make_mut(ptr));
+            normalize_type(env, ty);
+        }
         StmtT::Decl(_, ty) => normalize_type(env, ty),
         StmtT::Let(_, ty, value) => {
             normalize_type(env, ty);

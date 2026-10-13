@@ -9516,6 +9516,7 @@ fn collect_array_fill_stmts(tds: &Typedefs, ss: &Stmts, out: &mut BTreeMap<Strin
             StmtT::Call(e) | StmtT::Assert(e) | StmtT::Return(Some(e)) => {
                 collect_array_fill_expr(tds, e, out)
             }
+            StmtT::Retype { ptr, .. } => collect_array_fill_expr(tds, ptr, out),
             StmtT::Let(_, ty, e) => {
                 collect_array_fill_type(tds, ty, out);
                 collect_array_fill_expr(tds, e, out);
@@ -10179,6 +10180,8 @@ fn touch_stmts(ss: &Stmts, t: &mut Touched) {
     for s in ss.iter() {
         match &s.val {
             StmtT::Call(e) | StmtT::Assert(e) | StmtT::Return(Some(e)) => touch_expr(e, t),
+            // Re-typing is a write: it ends the object that was there.
+            StmtT::Retype { ptr, .. } => touch_expr(ptr, t),
             StmtT::Let(_, _, e) => touch_expr(e, t),
             StmtT::DeclStackArray { size, .. } => touch_expr(size, t),
             // The alias assignment itself stores nothing: the pointer is a
@@ -19129,6 +19132,40 @@ impl<'a> Body<'a> {
                 self.lines.push(format!("assert (pure ({}));", p));
                 Ok(())
             }
+            // `_retype((T *)p)`: 6.5p6 taken on its own, where no store says
+            // it. The object ends and uninitialised storage of the new type
+            // takes its place, which is the same step the store-driven case
+            // takes -- this only says where.
+            StmtT::Retype { ptr, ty } => {
+                let Some(to) = palow_name(self.tds, ty) else {
+                    return Err(format!(
+                        "a `_retype` to {}, which the model does not cover",
+                        describe(self.tds.resolve(ty))
+                    ));
+                };
+                let ExprT::Var(v) = &strip_casts(ptr).val else {
+                    return Err(
+                        "a `_retype` of something that is not a local holding an allocated block"
+                            .to_string(),
+                    );
+                };
+                let Some(i) = self
+                    .blocks
+                    .iter()
+                    .position(|b| b.var == *v.val && b.checked && !b.freed)
+                else {
+                    return Err(format!(
+                        "a `_retype` of `{}`, which is not an allocated block the body is \
+                         holding: only storage without a declared type can be re-typed",
+                        v.val
+                    ));
+                };
+                // Saying it twice is not an error, it is just already true.
+                if self.blocks[i].pn != to {
+                    self.retype_block(i, &to)?;
+                }
+                Ok(())
+            }
             StmtT::Break | StmtT::Continue if !self.in_loop => {
                 Err(format!("{} outside a loop", stmt_kind(s)))
             }
@@ -22232,6 +22269,7 @@ fn stmt_kind(s: &Stmt) -> &'static str {
         StmtT::Continue => "a `continue`",
         StmtT::Return(..) => "a non-tail `return`",
         StmtT::Assert(..) => "an assertion",
+        StmtT::Retype { .. } => "a `_retype`",
         StmtT::GhostStmt(..) => "inline Pulse",
         StmtT::Goto(..) | StmtT::Label { .. } | StmtT::GotoBlock { .. } => "a `goto`",
         StmtT::DeclStackArray { .. } => "a stack array",

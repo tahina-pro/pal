@@ -3115,6 +3115,36 @@ public:
                     ctx.mk_ghost_stmt(loc.clone(), ctr.value(), snippets));
                 return rust::Unit();
               }
+              // _retype((T *)p) expands to a compound statement holding
+              // `(void)((T *)p)` under a nullary annotation. The cast is the
+              // point: clang has already type-checked it, so the target type
+              // can be read off the AST rather than re-parsed out of a source
+              // snippet the way a captured predicate has to be.
+              if (auto ann = dyn_cast<AnnotateAttr>(a);
+                  ann && ann->args_size() == 0 &&
+                  ann->getAnnotation() == "pal-retype") {
+                if (auto *body = dyn_cast<CompoundStmt>(attr->getSubStmt())) {
+                  for (auto *inner : body->body()) {
+                    auto *e = dyn_cast<Expr>(inner);
+                    if (!e) {
+                      continue;
+                    }
+                    auto *cast = dyn_cast<CastExpr>(e->IgnoreParens());
+                    while (cast && !cast->getType()->isPointerType()) {
+                      cast = dyn_cast<CastExpr>(
+                          cast->getSubExpr()->IgnoreParens());
+                    }
+                    if (!cast) {
+                      continue;
+                    }
+                    auto pointee = cast->getType()->getPointeeType();
+                    stmts.push(
+                        mk_retype(loc.clone(), trRValue(cast->getSubExpr()),
+                                  trQualType(pointee, attr->getSourceRange())));
+                    return rust::Unit();
+                  }
+                }
+              }
             }
           }
         }

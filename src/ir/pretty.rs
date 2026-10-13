@@ -606,6 +606,13 @@ impl PrettyIR for StmtT {
                 .append(");")
                 .nest(2)
                 .group(),
+            StmtT::Retype { ptr, ty } => RcDoc::text("_retype((")
+                .append(ty.to_doc())
+                .append(" *)")
+                .append(ptr.to_doc())
+                .append(");")
+                .nest(2)
+                .group(),
             StmtT::GhostStmt(code) => RcDoc::text("_ghost_stmt(")
                 .append(inline_pulse_code_to_doc(code))
                 .append(");")

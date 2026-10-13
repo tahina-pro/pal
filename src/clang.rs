@@ -1055,6 +1055,9 @@ fn mk_stmt_err(loc: Rc<SourceInfo>) -> Rc<Stmt> {
 fn mk_assert(loc: Rc<SourceInfo>, v: Rc<Expr>) -> Rc<Stmt> {
     mk_ast(loc, StmtT::Assert(v))
 }
+fn mk_retype(loc: Rc<SourceInfo>, ptr: Rc<Expr>, ty: Rc<Type>) -> Rc<Stmt> {
+    mk_ast(loc, StmtT::Retype { ptr, ty })
+}
 fn mk_goto(loc: Rc<SourceInfo>, label: Rc<Ident>) -> Rc<Stmt> {
     mk_ast(loc, StmtT::Goto(label))
 }

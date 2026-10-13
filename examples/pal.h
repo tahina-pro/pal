@@ -27,6 +27,14 @@ __attribute__((annotate("pal-pure"))) _Bool pal_c_assert_enabled(void);
 
 #define _assert(p) ({ __attribute__((annotate("pal-assert", __capture_args(p)))) {} })
 #define _ghost_stmt(args) ({ __attribute__((annotate("pal-ghost-stmt", __capture_args(args)))) {} })
+/* C11 6.5p6, taken deliberately. `_retype((T *)p)` says that the allocated
+   object `p` points at stops being whatever it held and becomes uninitialised
+   storage of type `T`. A store through a `T *` already says this by itself and
+   needs no annotation; this is for where the storage changes hands at the new
+   type instead of being written through, so there is no store to read it off.
+   Storage with a declared type cannot be re-typed at all, and saying so here
+   does not make it so: that stays an error. */
+#define _retype(p) ({ __attribute__((annotate("pal-retype"))) { (void)(p); } })
 #define _ghost_arg(p) __attribute__((annotate("pal-ghost-arg", __capture_args(p))))
 
 #define _plain __attribute__((annotate("pal-plain")))
@@ -77,6 +85,7 @@ __attribute__((annotate("pal-pure"))) _Bool pal_c_assert_enabled(void);
 
 #define _assert(p) ((void)0)
 #define _ghost_stmt(args) ((void)0)
+#define _retype(p) ((void)0)
 #define _ghost_arg(p)
 
 #define _plain

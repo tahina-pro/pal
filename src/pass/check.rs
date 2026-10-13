@@ -733,6 +733,7 @@ impl<'a> Checker<'a> {
                 }
             }
             StmtT::Assert(v) => self.check_slprop(env, v),
+            StmtT::Retype { ptr, .. } => self.check_rvalue(env, ptr),
             StmtT::GhostStmt(code) => self.check_inline_pulse_code(env, code),
             StmtT::Goto(_) => {}
             StmtT::Label { ensures, .. } => {

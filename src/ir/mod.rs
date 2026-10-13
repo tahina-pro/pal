@@ -459,6 +459,18 @@ pub enum StmtT {
     Continue,
     Return(Option<Rc<Expr>>),
     Assert(Rc<Expr>),
+    /// `_retype((T *)p)`: C11 6.5p6, taken deliberately rather than as a side
+    /// effect of a store. The object `p` points at stops being whatever it
+    /// was and becomes uninitialised storage of type `T`.
+    ///
+    /// The store-driven case needs no annotation -- the emitter takes the step
+    /// when it sees a store whose lvalue type disagrees with what the block is
+    /// held at. This is for where there is no such store to read it off: the
+    /// storage changes hands at the new type instead of being written through.
+    Retype {
+        ptr: Rc<Expr>,
+        ty: Rc<Type>,
+    },
     GhostStmt(Rc<InlinePulseCode>),
     Goto(Rc<Ident>),
     Label {
